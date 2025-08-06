@@ -46,13 +46,31 @@ def get_org_detail(org_id):
     return None
 
 @st.cache_data(ttl=600)
-def search_datasets(limit=10000):
+def search_datasets_paginated(limit=10000):
     url = f"{CKAN_URL}/api/3/action/package_search"
-    params = {"rows": limit}
-    r = requests.get(url, headers=headers, params=params)
-    if r.status_code == 200:
-        return r.json()["result"]["results"]
-    return []
+    rows_per_page = 1000
+    all_results = []
+    for offset in range(0, limit, rows_per_page):
+        params = {"rows": rows_per_page, "start": offset}
+        r = requests.get(url, headers=headers, params=params)
+        if r.status_code == 200:
+            page = r.json()["result"]["results"]
+            if not page:
+                break
+            all_results.extend(page)
+        else:
+            break
+    return all_results
+
+@st.cache_data(ttl=600)
+def get_all_org_details():
+    org_ids = get_organizations()
+    org_details = []
+    for oid in org_ids:
+        detail = get_org_detail(oid)
+        if detail:
+            org_details.append(detail)
+    return org_details
 
 
 # === DATA LOADING ===
@@ -60,7 +78,7 @@ datasets = get_datasets()
 orgs = get_organizations()
 
 # Build dataset details + index
-dataset_data = search_datasets()
+dataset_data = search_datasets_paginated(limit=10000)
 df_datasets = pd.DataFrame([{
     "title": d.get("title"),
     "name": d.get("name"),
@@ -71,6 +89,7 @@ df_datasets = pd.DataFrame([{
     "views": d.get("tracking_summary", {}).get("total", 0)
 } for d in dataset_data])
 
+
 # Build org summary
 org_dataset_count = df_datasets["organization"].value_counts().to_dict()
 total_views = df_datasets["views"].sum()
@@ -79,6 +98,7 @@ df_datasets = pd.DataFrame([{
     "title": d["title"],
     "name": d["name"],
     "organization": d["organization"]["title"] if d.get("organization") else "—",
+    "org_id": d["organization"]["name"] if d.get("organization") else "unknown",
     "resources": len(d["resources"]),
     "last_modified": d.get("metadata_modified", "—"),
     "views": d.get("tracking_summary", {}).get("total", 0)
@@ -166,13 +186,23 @@ with tab2:
     st.markdown("### 🔍 Dataset Explorer")
 
     search = st.text_input("🔎 Search datasets or organizations", "")
-    org_titles = df_datasets["organization"].dropna().unique().tolist()
+    #org_titles = df_datasets["organization"].dropna().unique().tolist()
+    #org_titles = [get_org_detail(org)["title"] for org in orgs if get_org_detail(org)]
+
+    all_orgs = get_all_org_details()
+    org_titles = [org["title"] for org in all_orgs]
+    org_id_map = {org["title"]: org["name"] for org in all_orgs}
+    
     org_filter = st.selectbox("🏢 Filter by organization", ["All"] + sorted(org_titles))    
 
     filtered_df = df_datasets.copy()
 
+    #if org_filter != "All":
+    #    filtered_df = filtered_df[filtered_df["organization"] == org_filter]
+    
     if org_filter != "All":
-        filtered_df = filtered_df[filtered_df["organization"] == org_filter]
+        org_id = org_id_map[org_filter]
+        filtered_df = filtered_df[filtered_df["org_id"] == org_id]
 
     if search:
         search_lower = search.lower()
@@ -187,18 +217,6 @@ with tab2:
         return f'{CKAN_URL}/dataset/{row["name"]}'
     def make_download_link(row):
         return f'<a href="{CKAN_URL}/dataset/{row["name"]}" target="_blank">🔗 View Dataset</a>'
-
-    #def make_download_links(row):
-    #    for pkg in dataset_data:
-    #        if pkg.get("name") == row["name"]:
-    #            if pkg.get("resources"):
-    #                links = [
-    #                    f'<a href="{r["url"]}" target="_blank">{r["name"]}</a>'
-    #                    for r in pkg["resources"]
-    #                ]
-    #                return "<br>".join(links)
-    #            break
-    #    return "—"
 
     filtered_df_display = filtered_df.copy()
     #filtered_df_display["Download Links"] = filtered_df_display.apply(make_download_links, axis=1)
