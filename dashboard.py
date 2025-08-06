@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import pandas as pd
 import altair as alt
+import json
 import os
 from collections import defaultdict
 
@@ -9,6 +10,13 @@ from collections import defaultdict
 CKAN_URL = "https://gdcatalognhic.nha.co.th"  # no trailing slash
 API_KEY = os.getenv("CKAN_API_KEY")
 headers = {"Authorization": API_KEY}
+
+# === MANUAL CACHE REFRESH ===
+if "refresh_cache" not in st.session_state:
+    st.session_state.refresh_cache = False
+
+if st.button("🔄 Refresh Dataset Cache"):
+    st.session_state.refresh_cache = True
 
 # === PAGE SETUP ===
 st.set_page_config("CKAN Dashboard", layout="wide")
@@ -31,22 +39,22 @@ def get_datasets():
         return r.json()["result"]
     return []
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600)     #cache dataset_details
 def get_dataset_detail(dataset_id):
     r = requests.get(f"{CKAN_URL}/api/3/action/package_show?id={dataset_id}", headers=headers)
     if r.status_code == 200:
         return r.json()["result"]
     return None
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600)     #cache org_datails
 def get_org_detail(org_id):
     r = requests.get(f"{CKAN_URL}/api/3/action/organization_show?id={org_id}", headers=headers)
     if r.status_code == 200:
         return r.json()["result"]
     return None
 
-@st.cache_data(ttl=600)
-def search_datasets_paginated(limit=10000):
+@st.cache_data(ttl=3600)    #cache search_datasets
+def _search_datasets_paginated(limit=10000):
     url = f"{CKAN_URL}/api/3/action/package_search"
     rows_per_page = 1000
     all_results = []
@@ -61,15 +69,65 @@ def search_datasets_paginated(limit=10000):
         else:
             break
     return all_results
+def search_datasets_paginated(limit=10000):
+    cache_file = "dataset_cache.json"
 
-@st.cache_data(ttl=600)
+    # Force-refresh if requested
+    if st.session_state.refresh_cache:
+        st.session_state.refresh_cache = False  # reset flag
+        if os.path.exists(cache_file):
+            os.remove(cache_file)
+        st.cache_data.clear()  # clear all @cache_data results
+
+    # Try local file cache (only works locally)
+    if os.path.exists(cache_file):
+        #with open(cache_file, "r", encoding="utf-8") as f:
+        #    return json.load(f)
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            st.warning(f"⚠️ Failed to load cache file: {e}")
+            os.remove(cache_file)
+
+    # Fallback: fetch and save
+    data = _search_datasets_paginated(limit=limit)
+
+    try:
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except:
+        pass  # likely running on Streamlit Cloud — ignore write error
+
+    return data if data else []
+
+@st.cache_data(ttl=3600) #cache org_details
 def get_all_org_details():
+    cache_file = "org_details_cache.json"
+
+    # Try reading from file (fast)
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            os.remove(cache_file)
+
+    # Fallback: fetch all orgs from API
     org_ids = get_organizations()
     org_details = []
     for oid in org_ids:
         detail = get_org_detail(oid)
         if detail:
             org_details.append(detail)
+
+    # Save to local file (for faster reloads next time)
+    try:
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(org_details, f)
+    except:
+        pass  # skip on cloud
+
     return org_details
 
 
@@ -78,7 +136,12 @@ datasets = get_datasets()
 orgs = get_organizations()
 
 # Build dataset details + index
-dataset_data = search_datasets_paginated(limit=10000)
+with st.spinner("🔄 Fetching dataset list from CKAN..."):
+    dataset_data = search_datasets_paginated(limit=10000)
+st.success(f"✅ Loaded {len(dataset_data):,} datasets.")
+if not dataset_data:
+    st.error("❌ No datasets returned. Please try refreshing or check your CKAN connection.")
+    st.stop()  # Halts Streamlit execution safely
 df_datasets = pd.DataFrame([{
     "title": d.get("title"),
     "name": d.get("name"),
@@ -89,30 +152,20 @@ df_datasets = pd.DataFrame([{
     "views": d.get("tracking_summary", {}).get("total", 0)
 } for d in dataset_data])
 
-
 # Build org summary
 org_dataset_count = df_datasets["organization"].value_counts().to_dict()
 total_views = df_datasets["views"].sum()
-
-df_datasets = pd.DataFrame([{
-    "title": d["title"],
-    "name": d["name"],
-    "organization": d["organization"]["title"] if d.get("organization") else "—",
-    "org_id": d["organization"]["name"] if d.get("organization") else "unknown",
-    "resources": len(d["resources"]),
-    "last_modified": d.get("metadata_modified", "—"),
-    "views": d.get("tracking_summary", {}).get("total", 0)
-} for d in dataset_data])
 
 # === TABS ===
 tab1, tab2 = st.tabs(["📊 Overview", "🔍 Explorer"])
 
 # === TAB 1: OVERVIEW ===
 with tab1:
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("🏢 Organizations", len(orgs))
-    col2.metric("📦 Datasets", len(datasets))
-    col3.metric("👁️ Website Views (tracked)", total_views)
+    col2.metric("📦 Datasets (visible)", len(dataset_data))
+    col3.metric("📦 Datasets (total)", len(datasets))
+    col4.metric("👁️ Website Views (tracked)", total_views)
 
     sort_option = st.selectbox(
         "Sort datasets by organization",
@@ -196,9 +249,6 @@ with tab2:
     org_filter = st.selectbox("🏢 Filter by organization", ["All"] + sorted(org_titles))    
 
     filtered_df = df_datasets.copy()
-
-    #if org_filter != "All":
-    #    filtered_df = filtered_df[filtered_df["organization"] == org_filter]
     
     if org_filter != "All":
         org_id = org_id_map[org_filter]
