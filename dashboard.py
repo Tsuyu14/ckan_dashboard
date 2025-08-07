@@ -5,6 +5,7 @@ import altair as alt
 import json
 import os
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # === CONFIG ===
 CKAN_URL = "https://gdcatalognhic.nha.co.th"  # no trailing slash
@@ -20,7 +21,6 @@ if st.button("🔄 Refresh Dataset Cache"):
 
 # === PAGE SETUP ===
 st.set_page_config("CKAN Dashboard", layout="wide")
-
 st.title("🧭 NHIC CKAN Monitoring Dashboard")
 st.markdown("Connected to: " + CKAN_URL)
 
@@ -54,58 +54,62 @@ def get_org_detail(org_id):
     return None
 
 @st.cache_data(ttl=3600)    #cache search_datasets
-def _search_datasets_paginated(limit=10000):
+def get_dataset_count(): # Always get the total first
+    url = f"{CKAN_URL}/api/3/action/package_search"
+    params = {"rows": 0}  # We just want metadata
+    r = requests.get(url, headers=headers, params=params, timeout=10)
+    if r.status_code == 200:
+        return r.json()["result"]["count"]
+    return 0
+def _search_datasets_paginated_reliable(limit=10000):
     url = f"{CKAN_URL}/api/3/action/package_search"
     rows_per_page = 1000
     all_results = []
-    for offset in range(0, limit, rows_per_page):
-        params = {"rows": rows_per_page, "start": offset}
-        r = requests.get(url, headers=headers, params=params)
-        if r.status_code == 200:
-            page = r.json()["result"]["results"]
-            if not page:
-                break
-            all_results.extend(page)
-        else:
+    total_count = get_dataset_count()
+    st.write(f"📦 Total datasets from CKAN: {total_count:,}")
+    total_pages = (min(limit, total_count) + rows_per_page - 1) // rows_per_page
+
+    progress = st.progress(0, text="🔍 Loading datasets...")
+    log_area = st.empty()
+
+    for page in range(total_pages):
+        offset = page * rows_per_page
+        success = False
+        retries = 3
+
+        for attempt in range(1, retries + 1):
+            try:
+                params = {"rows": rows_per_page, "start": offset}
+                r = requests.get(url, headers=headers, params=params, timeout=15)
+                if r.status_code == 200:
+                    results = r.json()["result"].get("results", [])
+                    all_results.extend(results)
+                    success = True
+                    break
+                else:
+                    log_area.warning(f"⚠️ Page {page+1} attempt {attempt}: HTTP {r.status_code}")
+            except Exception as e:
+                log_area.warning(f"⚠️ Page {page+1} attempt {attempt}: {e}")
+
+        progress.progress((page + 1) / total_pages, text=f"🔍 Loaded page {page+1}/{total_pages}")
+
+        if not success:
+            st.error(f"❌ Failed to fetch page {page+1} after {retries} attempts.")
             break
+        else:
+            log_area.empty() 
+    progress.empty()
     return all_results
+
 def search_datasets_paginated(limit=10000):
     cache_file = "dataset_cache.json"
 
-    # Force-refresh if requested
     if st.session_state.refresh_cache:
-        st.session_state.refresh_cache = False  # reset flag
+        st.session_state.refresh_cache = False
         if os.path.exists(cache_file):
             os.remove(cache_file)
-        st.cache_data.clear()  # clear all @cache_data results
+        st.cache_data.clear()
 
-    # Try local file cache (only works locally)
-    if os.path.exists(cache_file):
-        #with open(cache_file, "r", encoding="utf-8") as f:
-        #    return json.load(f)
-        try:
-            with open(cache_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            st.warning(f"⚠️ Failed to load cache file: {e}")
-            os.remove(cache_file)
-
-    # Fallback: fetch and save
-    data = _search_datasets_paginated(limit=limit)
-
-    try:
-        with open(cache_file, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-    except:
-        pass  # likely running on Streamlit Cloud — ignore write error
-
-    return data if data else []
-
-@st.cache_data(ttl=3600) #cache org_details
-def get_all_org_details():
-    cache_file = "org_details_cache.json"
-
-    # Try reading from file (fast)
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
@@ -113,20 +117,34 @@ def get_all_org_details():
         except:
             os.remove(cache_file)
 
-    # Fallback: fetch all orgs from API
-    org_ids = get_organizations()
-    org_details = []
-    for oid in org_ids:
-        detail = get_org_detail(oid)
-        if detail:
-            org_details.append(detail)
-
-    # Save to local file (for faster reloads next time)
+    data = _search_datasets_paginated_reliable(limit=limit)
     try:
         with open(cache_file, "w", encoding="utf-8") as f:
-            json.dump(org_details, f)
+            json.dump(data, f)
     except:
-        pass  # skip on cloud
+        pass
+
+    return data if data else []
+
+@st.cache_data(ttl=3600)
+def get_all_org_details_parallel(max_threads=40):
+    org_ids = get_organizations()
+    org_details = []
+
+    def fetch_detail(org_id):
+        try:
+            r = requests.get(f"{CKAN_URL}/api/3/action/organization_show?id={org_id}", headers=headers, timeout=8)
+            if r.status_code == 200:
+                return r.json()["result"]
+        except:
+            return None
+
+    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        futures = {executor.submit(fetch_detail, oid): oid for oid in org_ids}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                org_details.append(result)
 
     return org_details
 
@@ -239,15 +257,11 @@ with tab2:
     st.markdown("### 🔍 Dataset Explorer")
 
     search = st.text_input("🔎 Search datasets or organizations", "")
-    #org_titles = df_datasets["organization"].dropna().unique().tolist()
-    #org_titles = [get_org_detail(org)["title"] for org in orgs if get_org_detail(org)]
-
-    all_orgs = get_all_org_details()
+    all_orgs = get_all_org_details_parallel()
     org_titles = [org["title"] for org in all_orgs]
     org_id_map = {org["title"]: org["name"] for org in all_orgs}
-    
-    org_filter = st.selectbox("🏢 Filter by organization", ["All"] + sorted(org_titles))    
 
+    org_filter = st.selectbox("🏢 Filter by organization", ["All"] + sorted(org_titles))    
     filtered_df = df_datasets.copy()
     
     if org_filter != "All":
@@ -269,7 +283,6 @@ with tab2:
         return f'<a href="{CKAN_URL}/dataset/{row["name"]}" target="_blank">🔗 View Dataset</a>'
 
     filtered_df_display = filtered_df.copy()
-    #filtered_df_display["Download Links"] = filtered_df_display.apply(make_download_links, axis=1)
     filtered_df_display["Dataset Link"] = filtered_df_display.apply(make_table_link, axis=1)
     view_mode = st.radio("📋 View mode", ["Table", "Detail (Markdown)"], horizontal=True)
 
