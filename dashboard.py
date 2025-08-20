@@ -127,7 +127,7 @@ def search_datasets_paginated(limit=10000):
     return data if data else []
 
 @st.cache_data(ttl=3600)
-def get_all_org_details_parallel(max_threads=40):
+def get_all_org_details_parallel(max_threads=20):
     org_ids = get_organizations()
     org_details = []
 
@@ -138,6 +138,7 @@ def get_all_org_details_parallel(max_threads=40):
                 return r.json()["result"]
         except:
             return None
+        return None
 
     with ThreadPoolExecutor(max_workers=max_threads) as executor:
         futures = {executor.submit(fetch_detail, oid): oid for oid in org_ids}
@@ -145,6 +146,12 @@ def get_all_org_details_parallel(max_threads=40):
             result = future.result()
             if result:
                 org_details.append(result)
+
+    # 🔧 fallback: ensure every org at least has id & title
+    fetched_ids = {org["name"] for org in org_details if "name" in org}
+    for oid in org_ids:
+        if oid not in fetched_ids:
+            org_details.append({"name": oid, "title": oid})  # fallback stub
 
     return org_details
 
@@ -260,8 +267,11 @@ with tab2:
     all_orgs = get_all_org_details_parallel()
     org_titles = [org["title"] for org in all_orgs]
     org_id_map = {org["title"]: org["name"] for org in all_orgs}
-
-    org_filter = st.selectbox("🏢 Filter by organization", ["All"] + sorted(org_titles))    
+ 
+    org_filter = st.selectbox(
+    f"🏢 Filter by organization (Total: {len(org_titles)})",
+    ["All"] + sorted(org_titles)
+    ) 
     filtered_df = df_datasets.copy()
     
     if org_filter != "All":
