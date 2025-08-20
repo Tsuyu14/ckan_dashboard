@@ -265,8 +265,14 @@ with tab2:
 
     search = st.text_input("🔎 Search datasets or organizations", "")
     all_orgs = get_all_org_details_parallel()
-    org_titles = [org["title"] for org in all_orgs]
-    org_id_map = {org["title"]: org["name"] for org in all_orgs}
+    org_titles = [
+        org.get("title") or org.get("display_name") or org.get("name")
+        for org in all_orgs
+    ]
+    org_id_map = {
+        (org.get("title") or org.get("display_name") or org.get("name")): org["name"]
+        for org in all_orgs
+    }
  
     org_filter = st.selectbox(
     f"🏢 Filter by organization (Total: {len(org_titles)})",
