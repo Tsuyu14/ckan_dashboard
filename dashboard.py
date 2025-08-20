@@ -128,14 +128,22 @@ def search_datasets_paginated(limit=10000):
 
 @st.cache_data(ttl=3600)
 def get_all_org_details_parallel(max_threads=20):
-    org_ids = get_organizations()
+    org_ids = get_organizations()  # CKAN returns list of slugs (org "name")
     org_details = []
 
     def fetch_detail(org_id):
         try:
-            r = requests.get(f"{CKAN_URL}/api/3/action/organization_show?id={org_id}", headers=headers, timeout=8)
+            r = requests.get(
+                f"{CKAN_URL}/api/3/action/organization_show?id={org_id}",
+                headers=headers,
+                timeout=8
+            )
             if r.status_code == 200:
-                return r.json()["result"]
+                org = r.json()["result"]
+                return {
+                    "name": org.get("name"),  # stable slug
+                    "title": org.get("title") or org.get("display_name") or org.get("name")  # fallback to readable
+                }
         except:
             return None
         return None
@@ -147,14 +155,7 @@ def get_all_org_details_parallel(max_threads=20):
             if result:
                 org_details.append(result)
 
-    # 🔧 fallback: ensure every org at least has id & title
-    fetched_ids = {org["name"] for org in org_details if "name" in org}
-    for oid in org_ids:
-        if oid not in fetched_ids:
-            org_details.append({"name": oid, "title": oid})  # fallback stub
-
     return org_details
-
 
 # === DATA LOADING ===
 datasets = get_datasets()
@@ -264,20 +265,15 @@ with tab2:
     st.markdown("### 🔍 Dataset Explorer")
 
     search = st.text_input("🔎 Search datasets or organizations", "")
+    
     all_orgs = get_all_org_details_parallel()
-    org_titles = [
-        org.get("title") or org.get("display_name") or org.get("name")
-        for org in all_orgs
-    ]
-    org_id_map = {
-        (org.get("title") or org.get("display_name") or org.get("name")): org["name"]
-        for org in all_orgs
-    }
- 
+    org_titles = [org["title"] for org in all_orgs]
+    org_id_map = {org["title"]: org["name"] for org in all_orgs}
     org_filter = st.selectbox(
-    f"🏢 Filter by organization (Total: {len(org_titles)})",
-    ["All"] + sorted(org_titles)
-    ) 
+        f"🏢 Filter by organization ({len(org_titles)} orgs)",
+        ["All"] + sorted(org_titles)
+    )
+
     filtered_df = df_datasets.copy()
     
     if org_filter != "All":
